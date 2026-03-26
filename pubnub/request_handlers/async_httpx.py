@@ -1,6 +1,7 @@
 from asyncio import Event
 import asyncio
 import logging
+import time
 import httpx
 import json  # noqa # pylint: disable=W0611
 import urllib
@@ -14,6 +15,11 @@ from pubnub.request_handlers.base import BaseRequestHandler
 from pubnub.structures import RequestOptions, ResponseInfo
 
 logger = logging.getLogger("pubnub")
+
+
+class WallClockTimeoutError(asyncio.TimeoutError):
+    """Raised when a wall-clock deadline is exceeded, typically due to system sleep."""
+    pass
 
 
 class PubNubAsyncHTTPTransport(httpx.AsyncHTTPTransport):
@@ -55,6 +61,39 @@ class AsyncHttpxRequestHandler(BaseRequestHandler):
 
     def threaded_request(self, **_):
         raise NotImplementedError("threaded_request is not implemented for asyncio handler")
+
+    WALL_CLOCK_CHECK_INTERVAL = 5.0
+
+    async def _request_with_wall_clock_deadline(self, request_arguments, timeout):
+        """Execute an HTTP request with wall-clock deadline enforcement.
+
+        On macOS and Linux, time.monotonic() (and thus asyncio timeouts, socket timeouts)
+        does not advance during system sleep. A 310-second subscribe timeout can take hours
+        of wall-clock time if the machine sleeps. This method uses time.time() (wall clock)
+        to enforce the deadline regardless of sleep, while yielding to the event loop between checks.
+        """
+        if timeout is None:
+            return await self._session.request(**request_arguments)
+
+        wall_deadline = time.time() + timeout
+        request_task = asyncio.ensure_future(self._session.request(**request_arguments))
+
+        try:
+            while True:
+                remaining = wall_deadline - time.time()
+                if remaining <= 0:
+                    request_task.cancel()
+                    raise WallClockTimeoutError("Wall-clock deadline exceeded (system sleep detected)")
+
+                done, _ = await asyncio.wait(
+                    {request_task},
+                    timeout=min(self.WALL_CLOCK_CHECK_INTERVAL, remaining)
+                )
+                if done:
+                    return request_task.result()
+        except BaseException:
+            request_task.cancel()
+            raise
 
     async def async_request(self, options_func, cancellation_event):
         """
@@ -103,7 +142,11 @@ class AsyncHttpxRequestHandler(BaseRequestHandler):
             'headers': request_headers,
             'url': full_url,
             'follow_redirects': options.allow_redirects,
-            'timeout': (options.connect_timeout, options.request_timeout),
+            'timeout': httpx.Timeout(
+                connect=options.connect_timeout,
+                read=options.request_timeout,
+                write=options.connect_timeout,
+                pool=options.connect_timeout),
         }
         if options.is_post() or options.is_patch():
             request_arguments['content'] = options.data
@@ -112,9 +155,8 @@ class AsyncHttpxRequestHandler(BaseRequestHandler):
         try:
             if not self._session:
                 await self.create_session()
-            response = await asyncio.wait_for(
-                self._session.request(**request_arguments),
-                options.request_timeout
+            response = await self._request_with_wall_clock_deadline(
+                request_arguments, options.request_timeout
             )
         except (asyncio.TimeoutError, asyncio.CancelledError):
             raise

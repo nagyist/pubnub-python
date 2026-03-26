@@ -62,6 +62,7 @@ from pubnub.event_engine.containers import PresenceStateContainer
 from pubnub.event_engine.models import events, states
 
 from pubnub.models.consumer.common import PNStatus
+from pubnub.models.consumer.pn_error_data import PNErrorData
 from pubnub.dtos import SubscribeOperation, UnsubscribeOperation
 from pubnub.event_engine.statemachine import StateMachine
 from pubnub.endpoints.presence.heartbeat import Heartbeat
@@ -69,7 +70,7 @@ from pubnub.endpoints.presence.leave import Leave
 from pubnub.endpoints.pubsub.subscribe import Subscribe
 from pubnub.pubnub_core import PubNubCore
 from pubnub.request_handlers.base import BaseRequestHandler
-from pubnub.request_handlers.async_httpx import AsyncHttpxRequestHandler
+from pubnub.request_handlers.async_httpx import AsyncHttpxRequestHandler, WallClockTimeoutError
 from pubnub.workers import SubscribeMessageWorker
 from pubnub.managers import SubscriptionManager, PublishSequenceManager, ReconnectionManager
 from pubnub import utils
@@ -234,9 +235,30 @@ class PubNubAsyncio(PubNubCore):
             res = await self._request_handler.async_request(options_func, cancellation_event)
             return res
         except PubNubException as e:
+            if e.status is not None:
+                status = e.status
+            else:
+                status = PNStatus()
+                status.category = PNStatusCategory.PNBadRequestCategory
+                status.error = True
+                status.error_data = PNErrorData(str(e), e)
+                status.status_code = e._status_code if e._status_code != 0 else None
             return PubNubAsyncioException(
                 result=None,
-                status=e.status
+                status=status
+            )
+        except WallClockTimeoutError:
+            return PubNubAsyncioException(
+                result=None,
+                status=options_func().create_status(
+                    PNStatusCategory.PNTimeoutCategory,
+                    None,
+                    None,
+                    exception=PubNubException(
+                        pn_error=PNERR_CLIENT_TIMEOUT,
+                        errormsg="Wall-clock deadline exceeded (system sleep detected)"
+                    )
+                )
             )
         except asyncio.TimeoutError:
             return PubNubAsyncioException(
